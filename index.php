@@ -35,6 +35,31 @@ if ($uri === '/favicon.ico') {
     exit;
 }
 
+// Обслуживаем статические файлы: style.css и app.js, если сервер проксирует всё на index.php
+if ($uri === '/style.css') {
+    $css = __DIR__ . '/style.css';
+    if (is_file($css)) {
+        header('Content-Type: text/css; charset=utf-8');
+        header('Cache-Control: public, max-age=3600');
+        readfile($css);
+    } else {
+        http_response_code(404);
+    }
+    exit;
+}
+
+if ($uri === '/app.js') {
+    $js = __DIR__ . '/app.js';
+    if (is_file($js)) {
+        header('Content-Type: application/javascript; charset=utf-8');
+        header('Cache-Control: public, max-age=3600');
+        readfile($js);
+    } else {
+        http_response_code(404);
+    }
+    exit;
+}
+
 // Маршрут: /bod — админка (HTML рендер здесь, JS и весь CRUD — в crud.php)
 if ($uri === '' || $uri === false) { $uri = '/'; }
 if ($uri === '/bod') {
@@ -259,7 +284,7 @@ function render_header(string $title, bool $with_topbar = true): void {
     echo '<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">';
     echo '<title>' . e($title) . ' — DOMLearn</title>';
     echo '<link rel="icon" href="/images/favicon.ico" type="image/x-icon">';
-    echo '<link rel="stylesheet" href="/style.css">';
+    echo '<link rel="stylesheet" href="/style.css?v=' . filemtime(__DIR__ . '/style.css') . '">';
     echo '<script src="/app.js?v=' . filemtime(__DIR__ . '/app.js') . '" defer></script>';
     echo '</head><body class="theme-light">';
     if ($with_topbar) {

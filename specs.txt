@@ -79,8 +79,8 @@ Frontend должен быть только чистый HTML, CSS, JavaScript. 
 База данных MySQL, к которой нужно подключаться, уже создана, но пустая. 
 Имеет следующие параметры подключения:
 DB_HOST=localhost
-DB_NAME=p-351366_dom-learn-full
-DB_USER=p-351366_dom-learn-full
+DB_NAME=p-351366_dom-learn
+DB_USER=p-351366_dom-learn
 DB_PASSWORD=Anna-140275
 DB_CHARSET=utf8mb4
 Запиши эти данные в файл .env .
