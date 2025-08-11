@@ -20,6 +20,18 @@ function e(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUB
 $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?? '/';
 $uri = rtrim($uri, '/');
 
+// Базовый путь приложения (если развернуто в подпапке домена)
+$__BASE = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
+if ($__BASE === '/') { $__BASE = ''; }
+function base_path(): string { global $__BASE; return $__BASE ?: ''; }
+function asset(string $path): string { $b = base_path(); return ($b === '' ? '' : $b) . $path; }
+
+// Учитываем базовый путь при сопоставлении маршрутов
+if (base_path() !== '' && strpos($uri, base_path()) === 0) {
+    $uri = substr($uri, strlen(base_path()));
+    if ($uri === '' || $uri === false) { $uri = '/'; }
+}
+
 // Корень сайта может быть не в / если развернуто в подпапке — используется относительная навигация
 
 // Обслуживаем favicon по пути /favicon.ico, чтобы исключить 404
@@ -35,25 +47,30 @@ if ($uri === '/favicon.ico') {
     exit;
 }
 
-// Обслуживаем статические файлы: style.css и app.js, если сервер проксирует всё на index.php
-if ($uri === '/style.css') {
-    $css = __DIR__ . '/style.css';
-    if (is_file($css)) {
-        header('Content-Type: text/css; charset=utf-8');
+// Обслуживаем статические файлы под специальным префиксом, чтобы обойти 404 со стороны веб-сервера
+if (preg_match('~^/__assets__/(.+)$~', $uri, $am)) {
+    $rel = $am[1];
+    // Безопасное вычисление пути (запрет выхода из директории)
+    $path = realpath(__DIR__ . '/' . $rel);
+    $root = realpath(__DIR__);
+    if ($path !== false && strpos($path, $root) === 0 && is_file($path)) {
+        // Определяем тип контента по расширению
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        $types = [
+            'css' => 'text/css; charset=utf-8',
+            'js'  => 'application/javascript; charset=utf-8',
+            'ico' => 'image/x-icon',
+            'png' => 'image/png',
+            'jpg' => 'image/jpeg',
+            'jpeg'=> 'image/jpeg',
+            'gif' => 'image/gif',
+            'svg' => 'image/svg+xml',
+            'webp'=> 'image/webp'
+        ];
+        $ct = $types[$ext] ?? 'application/octet-stream';
+        header('Content-Type: ' . $ct);
         header('Cache-Control: public, max-age=3600');
-        readfile($css);
-    } else {
-        http_response_code(404);
-    }
-    exit;
-}
-
-if ($uri === '/app.js') {
-    $js = __DIR__ . '/app.js';
-    if (is_file($js)) {
-        header('Content-Type: application/javascript; charset=utf-8');
-        header('Cache-Control: public, max-age=3600');
-        readfile($js);
+        readfile($path);
     } else {
         http_response_code(404);
     }
@@ -283,9 +300,9 @@ function render_header(string $title, bool $with_topbar = true): void {
     echo '<!doctype html><html lang="ru"><head>';
     echo '<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">';
     echo '<title>' . e($title) . ' — DOMLearn</title>';
-    echo '<link rel="icon" href="/images/favicon.ico" type="image/x-icon">';
-    echo '<link rel="stylesheet" href="/style.css?v=' . filemtime(__DIR__ . '/style.css') . '">';
-    echo '<script src="/app.js?v=' . filemtime(__DIR__ . '/app.js') . '" defer></script>';
+    echo '<link rel="icon" href="' . asset('/__assets__/images/favicon.ico') . '" type="image/x-icon">';
+    echo '<link rel="stylesheet" href="' . asset('/__assets__/style.css') . '?v=' . filemtime(__DIR__ . '/style.css') . '">';
+    echo '<script src="' . asset('/__assets__/app.js') . '?v=' . filemtime(__DIR__ . '/app.js') . '" defer></script>';
     echo '</head><body class="theme-light">';
     if ($with_topbar) {
         echo '<header class="topbar">';
@@ -333,7 +350,7 @@ function render_admin_page(): void {
     render_header('Админ-панель', false);
     echo '<main class="container admin">';
     echo '<div id="adminApp"></div>';
-    echo '<script src="/crud.php?action=admin_js"></script>';
+    echo '<script src="' . asset('/crud.php') . '?action=admin_js"></script>';
     echo '</main>';
     render_footer();
 }
