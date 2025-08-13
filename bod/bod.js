@@ -1,319 +1,33 @@
-<?php
-// crud.php
-// Единый файл BackEnd: подключение к БД, функции CRUD, загрузка изображений, выдача JS админки.
-// Вся публичная часть рендера выполняется в index.php. Здесь — только данные и API.
-
-// Включаем ошибки (по ТЗ — показываем и на проде на время тестирования)
-ini_set('display_errors', '1');
-ini_set('display_startup_errors', '1');
-error_reporting(E_ALL);
-
-if (session_status() === PHP_SESSION_NONE) session_start();
-
-// Базовый путь приложения (если развернуто в подпапке домена)
-$__BASE = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
-if ($__BASE === '/') { $__BASE = ''; }
-function base_path_crud(): string { global $__BASE; return $__BASE ?: ''; }
-function asset_crud(string $path): string { $b = base_path_crud(); return ($b === '' ? '' : $b) . $path; }
-
-// ================== Конфиг / подключение к БД ==================
-
-/**
- * Простой парсер .env (без внешних библиотек)
- */
-function env_load(string $path): array {
-    $res = [];
-    if (!is_file($path)) return $res;
-    $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if ($line === '' || str_starts_with($line, '#')) continue;
-        $pos = strpos($line, '=');
-        if ($pos === false) continue;
-        $key = trim(substr($line, 0, $pos));
-        $val = trim(substr($line, $pos + 1));
-        $res[$key] = $val;
-    }
-    return $res;
-}
-
-$env = env_load(__DIR__ . '/.env');
-$DB_HOST = $env['DB_HOST'] ?? 'localhost';
-$DB_NAME = $env['DB_NAME'] ?? '';
-$DB_USER = $env['DB_USER'] ?? '';
-$DB_PASSWORD = $env['DB_PASSWORD'] ?? '';
-$DB_CHARSET = $env['DB_CHARSET'] ?? 'utf8mb4';
-// Админские креды теперь из .env
-$ADMIN_LOGIN = $env['ADMIN_LOGIN'] ?? 'bodryakov.web';
-$ADMIN_PASSWORD = $env['ADMIN_PASSWORD'] ?? 'Anna-140275';
-
-/** @var PDO $pdo */
-$pdo = null;
-
-function db(): PDO {
-    static $pdo;
-    if ($pdo instanceof PDO) return $pdo;
-    global $DB_HOST, $DB_NAME, $DB_USER, $DB_PASSWORD, $DB_CHARSET;
-    $dsn = "mysql:host={$DB_HOST};dbname={$DB_NAME};charset={$DB_CHARSET}";
-    $opt = [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        PDO::ATTR_EMULATE_PREPARES => false,
-    ];
-    $pdo = new PDO($dsn, $DB_USER, $DB_PASSWORD, $opt);
-    // Устанавливаем collation соединения явно
-    $pdo->exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci");
-    return $pdo;
-}
-
-// ================== Публичные функции чтения (используются index.php) ==================
-
-/** Получить все уровни в порядке number ASC */
-function db_get_levels(): array {
-    $stmt = db()->query("SELECT id, number, title_ru, slug FROM levels ORDER BY number ASC");
-    return $stmt->fetchAll();
-}
-
-/** Получить уровень по number+slug */
-function db_get_level_by_number_slug(int $number, string $slug): ?array {
-    $stmt = db()->prepare("SELECT * FROM levels WHERE number=? AND slug=? LIMIT 1");
-    $stmt->execute([$number, $slug]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
-
-/** Секции по level_id (section_order ASC) */
-function db_get_sections_by_level_id(int $level_id): array {
-    $stmt = db()->prepare("SELECT * FROM sections WHERE level_id=? ORDER BY section_order ASC");
-    $stmt->execute([$level_id]);
-    return $stmt->fetchAll();
-}
-
-/** Найти раздел по level_id + section_order + slug */
-function db_get_section_by_level_order_slug(int $level_id, int $order, string $slug): ?array {
-    $stmt = db()->prepare("SELECT * FROM sections WHERE level_id=? AND section_order=? AND slug=? LIMIT 1");
-    $stmt->execute([$level_id, $order, $slug]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
-
-/** Уроки по section_id (lesson_order ASC) */
-function db_get_lessons_by_section_id(int $section_id): array {
-    $stmt = db()->prepare("SELECT * FROM lessons WHERE section_id=? ORDER BY lesson_order ASC");
-    $stmt->execute([$section_id]);
-    return $stmt->fetchAll();
-}
-
-/** Найти урок по section_id + lesson_order + slug */
-function db_get_lesson_by_section_order_slug(int $section_id, int $order, string $slug): ?array {
-    $stmt = db()->prepare("SELECT * FROM lessons WHERE section_id=? AND lesson_order=? AND slug=? LIMIT 1");
-    $stmt->execute([$section_id, $order, $slug]);
-    $row = $stmt->fetch();
-    return $row ?: null;
-}
-
-/** Предыдущий и следующий урок в разделе по lesson_order */
-function db_get_prev_next_lesson(int $section_id, int $order): array {
-    $prevStmt = db()->prepare("SELECT id, slug, lesson_order FROM lessons WHERE section_id=? AND lesson_order<? AND is_published=1 ORDER BY lesson_order DESC LIMIT 1");
-    $prevStmt->execute([$section_id, $order]);
-    $prev = $prevStmt->fetch();
-
-    $nextStmt = db()->prepare("SELECT id, slug, lesson_order FROM lessons WHERE section_id=? AND lesson_order>? AND is_published=1 ORDER BY lesson_order ASC LIMIT 1");
-    $nextStmt->execute([$section_id, $order]);
-    $next = $nextStmt->fetch();
-
-    return [ 'prev' => $prev ?: null, 'next' => $next ?: null ];
-}
-
-// ================== API (минимум для начала) ==================
-
-$action = $_GET['action'] ?? '';
-if ($action !== '') {
-    switch ($action) {
-        case 'admin_js':
-            // Явно отключаем кэширование, чтобы браузер всегда получал актуальную сборку админского JS
-            header('Content-Type: application/javascript; charset=utf-8');
-            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-            header('Cache-Control: post-check=0, pre-check=0', false);
-            header('Pragma: no-cache');
-            header('Expires: 0');
-            echo admin_js_bundle();
-            exit;
-        case 'upload_image':
-            api_upload_image();
-            exit;
-        case 'tree':
-            api_admin_tree();
-            exit;
-        case 'section_save':
-            api_section_save();
-            exit;
-        case 'section_delete':
-            api_section_delete();
-            exit;
-        case 'lesson_save':
-            api_lesson_save();
-            exit;
-        case 'lesson_delete':
-            api_lesson_delete();
-            exit;
-        case 'ping_login':
-            // Создаём сессию на сервере после валидации
-            if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') { http_response_code(405); json_response(['ok'=>false,'error'=>'method']); }
-            $raw = file_get_contents('php://input');
-            $data = json_decode($raw, true) ?: [];
-            if (admin_login((string)($data['l'] ?? ''), (string)($data['p'] ?? ''))) {
-                json_response(['ok'=>true]);
-            } else { http_response_code(401); json_response(['ok'=>false]); }
-            exit;
-        case 'logout':
-            if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') { http_response_code(405); json_response(['ok'=>false,'error'=>'method']); }
-            admin_logout();
-            json_response(['ok'=>true]);
-            exit;
-        case 'session_ok':
-            // Проверка активной сессии
-            if (is_admin_authenticated()) { json_response(['ok'=>true]); } else { http_response_code(401); json_response(['ok'=>false]); }
-            exit;
-        default:
-            http_response_code(400);
-            header('Content-Type: application/json');
-            echo json_encode(['error' => 'Unknown action']);
-            exit;
-    }
-}
-
-// ================== Загрузка изображений ==================
-
-/** Загрузка изображения в images/lesson_{lesson_id}/, форматы: png,jpg,webp; до 5 МБ */
-function api_upload_image(): void {
-    // Проверка метода
-    if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
-        http_response_code(405);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'Method not allowed']);
-        return;
-    }
-
-    // Простая проверка авторизации админки (сессия)
-    if (!is_admin_authenticated()) {
-        http_response_code(401);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'Unauthorized']);
-        return;
-    }
-
-    $lesson_id = (int)($_POST['lesson_id'] ?? 0);
-    if ($lesson_id <= 0) {
-        http_response_code(400);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'lesson_id is required']);
-        return;
-    }
-
-    if (!isset($_FILES['file'])) {
-        http_response_code(400);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'file is required']);
-        return;
-    }
-
-    $file = $_FILES['file'];
-    if ($file['error'] !== UPLOAD_ERR_OK) {
-        http_response_code(400);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'upload error', 'code' => $file['error']]);
-        return;
-    }
-
-    // Ограничение размера 5 МБ
-    if (($file['size'] ?? 0) > 5 * 1024 * 1024) {
-        http_response_code(400);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'file too large']);
-        return;
-    }
-
-    // Разрешённые форматы
-    $allowed = ['image/png' => 'png', 'image/jpeg' => 'jpg', 'image/webp' => 'webp'];
-    $finfo = new finfo(FILEINFO_MIME_TYPE);
-    $mime = $finfo->file($file['tmp_name']);
-    if (!isset($allowed[$mime])) {
-        http_response_code(400);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'unsupported type']);
-        return;
-    }
-
-    $ext = $allowed[$mime];
-
-    // Каталог урока
-    $dir = __DIR__ . '/images/lesson_' . $lesson_id;
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0775, true);
-    }
-
-    // Генерируем имя файла
-    $base = pathinfo($file['name'], PATHINFO_FILENAME);
-    $base = preg_replace('~[^a-zA-Z0-9_-]+~', '-', $base) ?: 'image';
-    $name = $base . '-' . date('Ymd-His') . '-' . substr(bin2hex(random_bytes(3)), 0, 6) . '.' . $ext;
-    $dest = $dir . '/' . $name;
-
-    if (!move_uploaded_file($file['tmp_name'], $dest)) {
-        http_response_code(500);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'failed to move file']);
-        return;
-    }
-
-    $url = '/images/lesson_' . $lesson_id . '/' . $name;
-    header('Content-Type: application/json');
-    echo json_encode(['url' => $url, 'filename' => $name]);
-}
-
-// ================== Примитивная аутентификация админки ==================
-
-function is_admin_authenticated(): bool {
-    return !empty($_SESSION['admin_ok']);
-}
-
-function admin_login(string $login, string $password): bool {
-    // Данные из .env
-    global $ADMIN_LOGIN, $ADMIN_PASSWORD;
-    $ok = ($login === $ADMIN_LOGIN && $password === $ADMIN_PASSWORD);
-    if ($ok) {
-        $_SESSION['admin_ok'] = true;
-    }
-    return $ok;
-}
-
-function admin_logout(): void {
-    $_SESSION = [];
-    if (ini_get('session.use_cookies')) {
-        $params = session_get_cookie_params();
-        setcookie(session_name(), '', time() - 42000, $params['path'], $params['domain'], $params['secure'], $params['httponly']);
-    }
-    session_destroy();
-}
-
-// ================== Минимальный JS для админки (рендер SPA без библиотек) ==================
-
-function admin_js_bundle(): string {
-    // Весь JS в одной строке для простоты; в реальном коде можно разбить
-    ob_start(); ?>
+// Бандл админки (вынесено из crud.php: admin_js_bundle)
+// Русские комментарии сохранены. Этот файл загружается статически как часть админки
+// Ожидает, что index.php проставит data-admin-base на #adminApp (фолбэк: window.ADMIN_BASE)
 (function(){
   'use strict';
 
-  // Базовый путь, прокинутый с сервера
-  var BASE = <?php echo json_encode(base_path_crud()); ?>;
+  // Базовый путь, прокинутый с сервера через index.php
+  var BASE = (function(){
+    try{
+      var el = (typeof document!=='undefined') ? document.getElementById('adminApp') : null;
+      if (el && el.dataset && typeof el.dataset.adminBase === 'string') return el.dataset.adminBase;
+    }catch(e){}
+    if (typeof window !== 'undefined' && typeof window.ADMIN_BASE === 'string') return window.ADMIN_BASE;
+    return '';
+  })();
   function u(p){ return (BASE ? BASE : '') + p; }
 
   var LS_REMEMBER = 'domlearn-remember';
-  
 
   function h(tag, attrs){
     var el = document.createElement(tag);
-    if (attrs) for (var k in attrs){ if (k==='text') el.textContent=attrs[k]; else el.setAttribute(k, attrs[k]); }
+    if (attrs) {
+      for (var k in attrs) {
+        if (k === 'text') {
+          el.textContent = attrs[k];
+        } else {
+          el.setAttribute(k, attrs[k]);
+        }
+      }
+    }
     return el;
   }
 
@@ -324,27 +38,41 @@ function admin_js_bundle(): string {
     var wrap = h('div', {class: 'admin-login'});
     var title = h('h2', {text: 'Вход в админ-панель'});
     var f = h('form');
-    var login = h('input'); login.type='text'; login.placeholder='Логин';
-    var pass = h('input'); pass.type='password'; pass.placeholder='Пароль';
+    var login = h('input'); 
+    login.type='text'; 
+    login.placeholder='Логин';
+    var pass = h('input');
+    pass.type = 'password';
+    pass.placeholder = 'Пароль';
     var rememberLbl = h('label');
-    var remember = h('input'); remember.type='checkbox';
+    var remember = h('input');
+    remember.type = 'checkbox';
     rememberLbl.appendChild(remember);
     rememberLbl.appendChild(document.createTextNode(' Запомнить меня'));
-    var btn = h('button', {text: 'Войти'}); btn.type='submit';
+    var btn = h('button', {text: 'Войти'});
+    btn.type = 'submit';
     var msg = h('div', {class: 'admin-msg'});
 
     // Если есть сессионная авторизация — сразу в панель
-    fetch(u('/crud.php?action=session_ok')).then(function(r){ if(r.ok) return r.json(); throw 0; }).then(function(){ mountPanel(); }).catch(function(){
-      // Если включён флаг remember — после логина не разлогинивать на перезагрузках
-    });
+    fetch(u('/api.php?action=session_ok'), { credentials: 'same-origin' })
+      .then(function(r){ return r.json(); })
+      .then(function(json){ if (json && json.ok) { mountPanel(); } })
+      .catch(function(){ /* игнор: покажем форму логина */ });
 
     f.addEventListener('submit', function(ev){
       ev.preventDefault();
       var l = login.value.trim();
       var p = pass.value;
-      fetch(u('/crud.php?action=ping_login'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({l:l,p:p})})
+      fetch(u('/api.php?action=ping_login'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({l:l,p:p}), credentials: 'same-origin'})
         .then(function(r){ if(!r.ok) throw new Error('Неверный логин или пароль'); return r.json(); })
-        .then(function(){ try{ if(remember.checked){ localStorage.setItem(LS_REMEMBER,'1'); } }catch(e){}; mountPanel(); })
+        .then(function(){
+          try {
+            if (remember.checked) {
+              localStorage.setItem(LS_REMEMBER,'1');
+            }
+          } catch(e) {}
+          mountPanel();
+        })
         .catch(function(e){ msg.textContent = (e && e.message) ? e.message : 'Ошибка авторизации'; });
     });
 
@@ -356,25 +84,36 @@ function admin_js_bundle(): string {
   }
 
   function api(url, opt){
+    // Поддержка базового префикса: если путь абсолютный и начинается с '/', префиксуем BASE
+    if (typeof url === 'string' && url.charAt(0) === '/') url = u(url);
     opt = opt || {};
+    if (!('credentials' in opt)) opt.credentials = 'same-origin';
     return fetch(url, opt).then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
   }
 
-  function el(tag, cls, txt){ var x=document.createElement(tag); if(cls) x.className=cls; if(txt) x.textContent=txt; return x; }
+  function el(tag, cls, txt){
+    var x = document.createElement(tag);
+    if (cls) x.className = cls;
+    if (txt) x.textContent = txt;
+    return x;
+  }
 
   function mountPanel(openSectionId){
     var root = document.getElementById('adminApp');
     root.innerHTML = '';
     var bar = h('div', {class:'admin-bar'});
     // Кнопки управления (справа): Перейти на сайт и Выйти
-    var visit = h('a', {text:'Перейти на сайт'}); visit.href = u('/'); visit.className = 'btn';
-    var logout = h('button', {text:'Выйти'}); logout.className = 'btn';
+    var visit = h('a', {text:'Перейти на сайт'});
+    visit.href = u('/');
+    visit.className = 'btn';
+    var logout = h('button', {text:'Выйти'});
+    logout.className = 'btn';
     var actions = el('div','actions');
     actions.appendChild(visit);
     actions.appendChild(logout);
     logout.addEventListener('click', function(){
       try{ localStorage.removeItem(LS_REMEMBER); }catch(e){}
-      fetch(u('/crud.php?action=logout'), {method:'POST'}).finally(mountLogin);
+      fetch(u('/api.php?action=logout'), {method:'POST'}).finally(mountLogin);
     });
     // Размещаем контейнер с кнопками справа через spacer + actions (grid: 1fr auto)
     var spacer = el('div','spacer');
@@ -384,15 +123,20 @@ function admin_js_bundle(): string {
     var shell = el('div','admin-shell');
     var left = el('div','admin-left');
     var right = el('div','admin-right');
-    shell.appendChild(left); shell.appendChild(right);
+    shell.appendChild(left);
+    shell.appendChild(right);
 
     root.appendChild(bar);
     root.appendChild(shell);
 
     // Загрузка дерева
-    api(u('/crud.php?action=tree')).then(function(data){
-      renderTree(left, right, data, openSectionId);
-    }).catch(function(err){ left.textContent = 'Ошибка загрузки: '+err.message; });
+    api(u('/api.php?action=tree'))
+      .then(function(data){
+        renderTree(left, right, data, openSectionId);
+      })
+      .catch(function(err){
+        left.textContent = 'Ошибка загрузки: '+err.message; 
+      });
   }
 
   function renderTree(left, right, data, openSectionId){
@@ -417,45 +161,83 @@ function admin_js_bundle(): string {
     var currentLevelIndex = 0;
     var currentSectionId = null;
 
-    function selectLevel(i){ currentLevelIndex = i; renderSections(); lessonsWrap.innerHTML=''; }
+    function selectLevel(i) {
+      currentLevelIndex = i; 
+      renderSections(); 
+      lessonsWrap.innerHTML=''; 
+    }
+    
     function renderSections(){
       sectionsWrap.innerHTML = '';
       var lv = levels[currentLevelIndex];
-      var head = el('div','head'); head.textContent = 'Разделы — '+lv.title_ru; sectionsWrap.appendChild(head);
+      var head = el('div','head');
+      head.textContent = 'Разделы — '+lv.title_ru;
+      sectionsWrap.appendChild(head);
       var addBtn = el('button','btn', '➕ Добавить раздел');
       addBtn.addEventListener('click', function(){
         var title = prompt('Название раздела (рус)'); if(!title) return;
         var slug = prompt('Slug (только a-z и -)'); if(!slug) return;
-        api(u('/crud.php?action=section_save'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ level_id: lv.id, title_ru: title, slug: slug })})
-          .then(function(){ return api(u('/crud.php?action=tree')); })
-          .then(function(d){ data=d; levels=d.levels||[]; renderSections(); lessonsWrap.innerHTML=''; })
+        api(u('/api.php?action=section_save'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ level_id: lv.id, title_ru: title, slug: slug })})
+          .then(function(){ return api(u('/api.php?action=tree')); })
+          .then(function(d){
+            data = d;
+            levels = d.levels || [];
+            renderSections();
+            lessonsWrap.innerHTML = '';
+          })
           .catch(function(e){ alert('Ошибка: '+e.message); });
       });
       sectionsWrap.appendChild(addBtn);
 
-      var ul = el('ul','list'); ul.setAttribute('data-level', lv.id);
+      var ul = el('ul','list');
+      ul.setAttribute('data-level', lv.id);
       (lv.sections||[]).forEach(function(sec){
-        var li = el('li','item'); li.dataset.id = sec.id;
+        var li = el('li','item');
+        li.dataset.id = sec.id;
         var a = el('a',null, sec.section_order+'. '+sec.title_ru);
-        a.href='#'; a.addEventListener('click', function(ev){ ev.preventDefault(); currentSectionId=sec.id; renderLessons(sec); });
-        var edit = el('button','sm','✎'); edit.title='Редактировать';
+        a.href = '#';
+        a.addEventListener('click', function(ev){
+          ev.preventDefault();
+          currentSectionId = sec.id;
+          renderLessons(sec);
+        });
+        var edit = el('button','sm','✎');
+        edit.title = 'Редактировать';
         edit.addEventListener('click', function(){
           var title = prompt('Название раздела', sec.title_ru); if(!title) return;
           var slug = prompt('Slug', sec.slug); if(!slug) return;
-          api(u('/crud.php?action=section_save'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: sec.id, level_id: lv.id, title_ru: title, slug: slug, section_order: sec.section_order })})
-            .then(function(){ return api(u('/crud.php?action=tree')); })
-            .then(function(d){ data=d; levels=d.levels||[]; renderSections(); if(currentSectionId===sec.id){ var s=findSection(sec.id); if(s) renderLessons(s); } })
+          api(u('/api.php?action=section_save'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: sec.id, level_id: lv.id, title_ru: title, slug: slug, section_order: sec.section_order })})
+            .then(function(){ return api(u('/api.php?action=tree')); })
+            .then(function(d){
+              data = d;
+              levels = d.levels || [];
+              renderSections();
+              if (currentSectionId === sec.id) {
+                var s = findSection(sec.id);
+                if (s) renderLessons(s);
+              }
+            })
             .catch(function(e){ alert('Ошибка: '+e.message); });
         });
-        var del = el('button','sm','🗑'); del.title='Удалить';
+        var del = el('button','sm','🗑');
+        del.title = 'Удалить';
         del.addEventListener('click', function(){
           if(!confirm('Удалить раздел и все его уроки?')) return;
-          api(u('/crud.php?action=section_delete'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: sec.id })})
-            .then(function(){ return api(u('/crud.php?action=tree')); })
-            .then(function(d){ data=d; levels=d.levels||[]; currentSectionId=null; renderSections(); lessonsWrap.innerHTML=''; })
+          api(u('/api.php?action=section_delete'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: sec.id })})
+            .then(function(){ return api(u('/api.php?action=tree')); })
+            .then(function(d){
+              data = d;
+              levels = d.levels || [];
+              currentSectionId = null;
+              renderSections();
+              lessonsWrap.innerHTML = '';
+            })
             .catch(function(e){ alert('Ошибка: '+e.message); });
         });
-        li.appendChild(a); li.appendChild(edit); li.appendChild(del); ul.appendChild(li);
+        li.appendChild(a);
+        li.appendChild(edit);
+        li.appendChild(del);
+        ul.appendChild(li);
       });
 
       sectionsWrap.appendChild(ul);
@@ -471,18 +253,30 @@ function admin_js_bundle(): string {
     // Рендер списка уроков выбранного раздела
     function renderLessons(sec){
       lessonsWrap.innerHTML = '';
-      var head = el('div','head'); head.textContent = 'Уроки — '+sec.title_ru; lessonsWrap.appendChild(head);
+      var head = el('div','head');
+      head.textContent = 'Уроки — '+sec.title_ru;
+      lessonsWrap.appendChild(head);
 
       var addBtn = el('button','btn','➕ Добавить урок');
       addBtn.addEventListener('click', function(){
         // Открываем редактор нового урока (с пустым контентом)
-        openLessonEditor({ id:null, section_id: sec.id, title_ru:'', slug:'', is_published:0, content:{ tests:[], tasks:[], theory_html:'' } }, true);
+        if (window.AdminEditor && typeof window.AdminEditor.openLessonEditor==='function') {
+          window.AdminEditor.openLessonEditor(
+            { id:null, section_id: sec.id, title_ru:'', slug:'', is_published:0, content:{ tests:[], tasks:[], theory_html:'' } },
+            true,
+            function(sectionId){ mountPanel(sectionId || sec.id); }
+          );
+        } else {
+          alert('Модуль редактора не загружен');
+        }
       });
       lessonsWrap.appendChild(addBtn);
 
-      var ul = el('ul','list'); ul.setAttribute('data-section', sec.id);
+      var ul = el('ul','list');
+      ul.setAttribute('data-section', sec.id);
       (sec.lessons||[]).forEach(function(ls){
-        var li = el('li','item'); li.dataset.id = ls.id;
+        var li = el('li','item');
+        li.dataset.id = ls.id;
         var title = el('a', null, (ls.lesson_order||0)+'. '+ls.title_ru);
         if (ls.is_published){
           var ok = el('span', null, '✓');
@@ -491,14 +285,23 @@ function admin_js_bundle(): string {
           title.appendChild(ok);
         }
         title.href = '#';
-        title.addEventListener('click', function(ev){ ev.preventDefault(); openLessonEditor(ls, false); });
+        title.addEventListener('click', function(ev){
+          ev.preventDefault();
+          if (window.AdminEditor && typeof window.AdminEditor.openLessonEditor==='function') {
+            window.AdminEditor.openLessonEditor(ls, false, function(sectionId){ mountPanel(sectionId || ls.section_id); });
+          } else { alert('Модуль редактора не загружен'); }
+        });
         var edit = el('button','sm','✎'); edit.title='Редактировать';
-        edit.addEventListener('click', function(){ openLessonEditor(ls, false); });
+        edit.addEventListener('click', function(){
+          if (window.AdminEditor && typeof window.AdminEditor.openLessonEditor==='function') {
+            window.AdminEditor.openLessonEditor(ls, false, function(sectionId){ mountPanel(sectionId || ls.section_id); });
+          } else { alert('Модуль редактора не загружен'); }
+        });
         var del = el('button','sm','🗑'); del.title='Удалить';
         del.addEventListener('click', function(){
           if(!confirm('Удалить урок?')) return;
-          api(u('/crud.php?action=lesson_delete'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: ls.id })})
-            .then(function(){ return api(u('/crud.php?action=tree')); })
+          api(u('/api.php?action=lesson_delete'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: ls.id })})
+            .then(function(){ return api(u('/api.php?action=tree')); })
             .then(function(d){
               // Обновим локальные данные и перерисуем список для текущего раздела
               data = d; levels = d.levels||[];
@@ -609,7 +412,7 @@ function admin_js_bundle(): string {
           var form = new FormData();
           form.append('file', file);
           form.append('lesson_id', ls.id ? String(ls.id) : '0');
-          fetch(u('/crud.php?action=upload_image'), { method:'POST', body: form })
+          fetch(u('/api.php?action=upload_image'), { method:'POST', body: form, credentials: 'same-origin' })
             .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
             .then(function(json){ if(json && json.url){ resolve({ default: json.url }); } else { reject('Некорректный ответ сервера'); } })
             .catch(function(e){ reject(e); });
@@ -662,8 +465,6 @@ function admin_js_bundle(): string {
     var testsBuilderWrap = document.createElement('div'); testsBuilderWrap.className = 'builder tests-builder';
     var tasksBuilderWrap = document.createElement('div'); tasksBuilderWrap.className = 'builder tasks-builder';
 
-    // Конструкторы будут показаны по умолчанию, без переключателей
-
     // Стили перенесены в style.css
 
     // Хранилища инстансов редакторов для динамических элементов
@@ -702,8 +503,6 @@ function admin_js_bundle(): string {
           var inp = document.createElement('input'); inp.type='text'; inp.placeholder='Ответ'; inp.value = val||'';
           row.appendChild(rb); row.appendChild(inp); answersWrap.appendChild(row);
         }
-
-        function renumberAnswers(){ /* индексация не требуется при фиксированных 4 вариантах */ }
 
         // Кнопки добавления/удаления ответов убраны — всегда 4 варианта
 
@@ -949,7 +748,7 @@ function admin_js_bundle(): string {
           theory_html: (ckeEditor? ckeEditor.getData() : (taTheory.value||''))
         }
       };
-      return api('/crud.php?action=lesson_save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      return api('/api.php?action=lesson_save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     }
 
     btnSave.addEventListener('click', function(){
@@ -968,159 +767,9 @@ function admin_js_bundle(): string {
     });
 
     // Отключаем закрытие по клику вне окна: модалка закрывается только кнопкой/крестиком
-    dlg.addEventListener('click', function(e){ /* backdrop click disabled */ });
+    dlg.addEventListener('click', function(e){ /* отключено закрытие по клику по подложке */ });
   }
 
   // Инициализация
   mountLogin();
 })();
-<?php
-    return ob_get_clean();
-}
-
-// На прямой вызов файла без action — ничего не рендерим
-// Все функции используются из index.php
-
-// ================== Вспомогательные общие функции API/CRUD ==================
-
-function json_response($data): void {
-    header('Content-Type: application/json; charset=utf-8');
-    echo json_encode($data, JSON_UNESCAPED_UNICODE);
-}
-
-function validate_slug(string $slug): bool {
-    return (bool)preg_match('~^[a-z-]+$~', $slug);
-}
-
-function rrmdir(string $dir): void {
-    if (!is_dir($dir)) return;
-    $items = scandir($dir);
-    foreach ($items as $it) {
-        if ($it === '.' || $it === '..') continue;
-        $path = $dir . DIRECTORY_SEPARATOR . $it;
-        if (is_dir($path)) rrmdir($path); else @unlink($path);
-    }
-    @rmdir($dir);
-}
-
-// ================== TREE для админки ==================
-function api_admin_tree(): void {
-    if (!is_admin_authenticated()) { http_response_code(401); json_response(['error'=>'Unauthorized']); return; }
-    // уровни
-    $levels = db_get_levels();
-    foreach ($levels as &$lv) {
-        $secs = db_get_sections_by_level_id((int)$lv['id']);
-        foreach ($secs as &$sec) {
-            $lsStmt = db()->prepare('SELECT id, section_id, title_ru, slug, lesson_order, is_published, content FROM lessons WHERE section_id=? ORDER BY lesson_order ASC');
-            $lsStmt->execute([(int)$sec['id']]);
-            $sec['lessons'] = $lsStmt->fetchAll();
-            foreach ($sec['lessons'] as &$ls) { $ls['content'] = json_decode($ls['content'], true); }
-        }
-        $lv['sections'] = $secs;
-    }
-    json_response(['levels'=>$levels]);
-}
-
-// ================== SECTIONS: save/delete/reorder ==================
-function api_section_save(): void {
-    if (!is_admin_authenticated()) { http_response_code(401); json_response(['error'=>'Unauthorized']); return; }
-    if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') { http_response_code(405); json_response(['error'=>'method']); return; }
-    $data = json_decode(file_get_contents('php://input'), true) ?: [];
-    $id = isset($data['id']) ? (int)$data['id'] : 0;
-    $level_id = (int)($data['level_id'] ?? 0);
-    $title_ru = trim((string)($data['title_ru'] ?? ''));
-    $slug = trim((string)($data['slug'] ?? ''));
-    $order = $data['section_order'] ?? null; $order = ($order===null? null : (int)$order);
-
-    if ($level_id<=0 || $title_ru==='') { http_response_code(400); json_response(['error'=>'level_id и title_ru обязательны']); return; }
-    if (!validate_slug($slug)) { http_response_code(400); json_response(['error'=>'Неверный slug']); return; }
-
-    // Проверка уникальности slug в уровне
-    $q = db()->prepare('SELECT id FROM sections WHERE level_id=? AND slug=?' . ($id? ' AND id<>?' : ''));
-    $params = [$level_id, $slug]; if ($id) $params[] = $id; $q->execute($params);
-    if ($q->fetch()) { http_response_code(400); json_response(['error'=>'Такой slug уже есть в уровне']); return; }
-
-    if ($id) {
-        // update
-        if ($order===null) {
-            // оставить прежний order
-            $cur = db()->prepare('SELECT section_order FROM sections WHERE id=?'); $cur->execute([$id]); $order = (int)($cur->fetch()['section_order'] ?? 1);
-        }
-        // проверка уникальности order
-        $qo = db()->prepare('SELECT id FROM sections WHERE level_id=? AND section_order=? AND id<>?'); $qo->execute([$level_id, $order, $id]);
-        if ($qo->fetch()) { http_response_code(400); json_response(['error'=>'Такой порядковый номер уже занят']); return; }
-        $st = db()->prepare('UPDATE sections SET level_id=?, title_ru=?, slug=?, section_order=? WHERE id=?');
-        $st->execute([$level_id, $title_ru, $slug, $order, $id]);
-        json_response(['ok'=>true, 'id'=>$id]);
-    } else {
-        if ($order===null) {
-            $mx = db()->prepare('SELECT COALESCE(MAX(section_order),0) m FROM sections WHERE level_id=?'); $mx->execute([$level_id]); $order = ((int)$mx->fetch()['m']) + 1;
-        } else {
-            $qo = db()->prepare('SELECT id FROM sections WHERE level_id=? AND section_order=?'); $qo->execute([$level_id, $order]); if ($qo->fetch()) { http_response_code(400); json_response(['error'=>'Такой порядковый номер уже занят']); return; }
-        }
-        $st = db()->prepare('INSERT INTO sections(level_id,title_ru,slug,section_order) VALUES (?,?,?,?)');
-        $st->execute([$level_id, $title_ru, $slug, $order]);
-        json_response(['ok'=>true, 'id'=> (int)db()->lastInsertId() ]);
-    }
-}
-
-function api_section_delete(): void {
-    if (!is_admin_authenticated()) { http_response_code(401); json_response(['error'=>'Unauthorized']); return; }
-    if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') { http_response_code(405); json_response(['error'=>'method']); return; }
-    $data = json_decode(file_get_contents('php://input'), true) ?: [];
-    $id = (int)($data['id'] ?? 0);
-    if ($id<=0) { http_response_code(400); json_response(['error'=>'id required']); return; }
-    // удалить папки уроков этого раздела
-    $ls = db()->prepare('SELECT id FROM lessons WHERE section_id=?'); $ls->execute([$id]);
-    foreach ($ls->fetchAll() as $row) { rrmdir(__DIR__ . '/images/lesson_' . (int)$row['id']); }
-    // удалить раздел (каскад удалит уроки)
-    $st = db()->prepare('DELETE FROM sections WHERE id=?'); $st->execute([$id]);
-    json_response(['ok'=>true]);
-}
-
-// ================== LESSONS: save/delete/reorder ==================
-function api_lesson_save(): void {
-    if (!is_admin_authenticated()) { http_response_code(401); json_response(['error'=>'Unauthorized']); return; }
-    if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') { http_response_code(405); json_response(['error'=>'method']); return; }
-    $data = json_decode(file_get_contents('php://input'), true) ?: [];
-    $id = isset($data['id']) ? (int)$data['id'] : 0;
-    $section_id = (int)($data['section_id'] ?? 0);
-    $title_ru = trim((string)($data['title_ru'] ?? ''));
-    $slug = trim((string)($data['slug'] ?? ''));
-    $is_published = !empty($data['is_published']) ? 1 : 0;
-    $content = $data['content'] ?? ['tests'=>[],'tasks'=>[],'theory_html'=>''];
-
-    if ($section_id<=0 || $title_ru==='') { http_response_code(400); json_response(['error'=>'section_id и title_ru обязательны']); return; }
-    if (!validate_slug($slug)) { http_response_code(400); json_response(['error'=>'Неверный slug']); return; }
-    // нормализуем контент
-    $norm = [ 'tests'=> (array)($content['tests'] ?? []), 'tasks'=> (array)($content['tasks'] ?? []), 'theory_html'=> (string)($content['theory_html'] ?? '') ];
-    $json = json_encode($norm, JSON_UNESCAPED_UNICODE);
-
-    if ($id) {
-        // проверить уникальность slug в разделе
-        $q = db()->prepare('SELECT id FROM lessons WHERE section_id=? AND slug=? AND id<>?'); $q->execute([$section_id, $slug, $id]); if ($q->fetch()) { http_response_code(400); json_response(['error'=>'Такой slug уже есть в разделе']); return; }
-        $st = db()->prepare('UPDATE lessons SET section_id=?, title_ru=?, slug=?, content=?, is_published=? WHERE id=?');
-        $st->execute([$section_id, $title_ru, $slug, $json, $is_published, $id]);
-        json_response(['ok'=>true, 'id'=>$id]);
-    } else {
-        // определить порядок: следующий
-        $mx = db()->prepare('SELECT COALESCE(MAX(lesson_order),0) m FROM lessons WHERE section_id=?'); $mx->execute([$section_id]); $order = ((int)$mx->fetch()['m']) + 1;
-        // проверка уникальности slug в разделе
-        $q = db()->prepare('SELECT id FROM lessons WHERE section_id=? AND slug=?'); $q->execute([$section_id, $slug]); if ($q->fetch()) { http_response_code(400); json_response(['error'=>'Такой slug уже есть в разделе']); return; }
-        $st = db()->prepare('INSERT INTO lessons(section_id,title_ru,slug,lesson_order,content,is_published) VALUES (?,?,?,?,?,?)');
-        $st->execute([$section_id, $title_ru, $slug, $order, $json, $is_published]);
-        json_response(['ok'=>true, 'id'=> (int)db()->lastInsertId() ]);
-    }
-}
-
-function api_lesson_delete(): void {
-    if (!is_admin_authenticated()) { http_response_code(401); json_response(['error'=>'Unauthorized']); return; }
-    if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') { http_response_code(405); json_response(['error'=>'method']); return; }
-    $data = json_decode(file_get_contents('php://input'), true) ?: [];
-    $id = (int)($data['id'] ?? 0);
-    if ($id<=0) { http_response_code(400); json_response(['error'=>'id required']); return; }
-    // удалить папку изображений
-    rrmdir(__DIR__ . '/images/lesson_' . $id);
-    $st = db()->prepare('DELETE FROM lessons WHERE id=?'); $st->execute([$id]);
-    json_response(['ok'=>true]);
-}

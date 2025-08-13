@@ -1,17 +1,13 @@
 <?php
 // index.php
 // Публичная часть приложения: роутинг и отображение уровней, разделов и уроков.
-// ВНИМАНИЕ: Взаимодействие с БД и весь CRUD находятся в crud.php. Здесь только рендер публичных страниц.
+// ВНИМАНИЕ: Взаимодействие с БД вынесено в db-api.php. Здесь только рендер публичных страниц.
 
-// Включаем показ ошибок (по ТЗ — на время тестирования и в проде тоже)
-ini_set('display_errors', '1');
-ini_set('display_startup_errors', '1');
-error_reporting(E_ALL);
+// Показ ошибок отключён на проде (централизовано в config.php)
 
-session_start();
-
-// Подключаем функции чтения данных из crud.php (CRUD и подключение к БД реализованы там)
-require_once __DIR__ . '/crud.php';
+// Подключаем слой данных и хелперы (config.php подхватывается внутри db-api.php)
+require_once __DIR__ . '/db-api.php';
+require_once __DIR__ . '/helpers.php';
 
 // Утилита: безопасный вывод
 function e(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
@@ -20,11 +16,7 @@ function e(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUB
 $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?? '/';
 $uri = rtrim($uri, '/');
 
-// Базовый путь приложения (если развернуто в подпапке домена)
-$__BASE = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
-if ($__BASE === '/') { $__BASE = ''; }
-function base_path(): string { global $__BASE; return $__BASE ?: ''; }
-function asset(string $path): string { $b = base_path(); return ($b === '' ? '' : $b) . $path; }
+// Базовый путь приложения (если развернуто в подпапке домена) — используем helpers::base_path()/asset()
 
 // Учитываем базовый путь при сопоставлении маршрутов
 if (base_path() !== '' && strpos($uri, base_path()) === 0) {
@@ -39,8 +31,62 @@ if ($uri === '/favicon.ico') {
     $fav = __DIR__ . '/images/favicon.ico';
     if (is_file($fav)) {
         header('Content-Type: image/x-icon');
-        header('Cache-Control: public, max-age=604800'); // 7 days
+        header('Cache-Control: public, max-age=604800'); // 7 дней
         readfile($fav);
+    } else {
+        http_response_code(404);
+    }
+    exit;
+}
+
+// Обслуживаем статические файлы из /assets без mod_rewrite (надёжно на любом хостинге)
+if (preg_match('~^/assets/(.+)$~', $uri, $am)) {
+    $rel = $am[1];
+    $path = realpath(__DIR__ . '/assets/' . $rel);
+    $root = realpath(__DIR__ . '/assets');
+    if ($path !== false && strpos($path, $root) === 0 && is_file($path)) {
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        $types = [
+            'css' => 'text/css; charset=utf-8',
+            'js'  => 'application/javascript; charset=utf-8',
+            'ico' => 'image/x-icon',
+            'png' => 'image/png',
+            'jpg' => 'image/jpeg',
+            'jpeg'=> 'image/jpeg',
+            'gif' => 'image/gif',
+            'svg' => 'image/svg+xml',
+            'webp'=> 'image/webp'
+        ];
+        $ct = $types[$ext] ?? 'application/octet-stream';
+        header('Content-Type: ' . $ct);
+        header('Cache-Control: public, max-age=3600');
+        readfile($path);
+    } else {
+        http_response_code(404);
+    }
+    exit;
+}
+
+// Обслуживаем загруженные медиа из /uploads с безопасной валидацией пути
+if (preg_match('~^/uploads/(.+)$~', $uri, $um)) {
+    $rel = $um[1];
+    $uploadsRoot = realpath(__DIR__ . '/uploads');
+    $path = realpath(__DIR__ . '/uploads/' . $rel);
+    if ($uploadsRoot !== false && $path !== false && strpos($path, $uploadsRoot) === 0 && is_file($path)) {
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        $types = [
+            'png' => 'image/png',
+            'jpg' => 'image/jpeg',
+            'jpeg'=> 'image/jpeg',
+            'gif' => 'image/gif',
+            'webp'=> 'image/webp',
+            'ico' => 'image/x-icon',
+            'svg' => 'image/svg+xml'
+        ];
+        $ct = $types[$ext] ?? 'application/octet-stream';
+        header('Content-Type: ' . $ct);
+        header('Cache-Control: public, max-age=604800'); // 7 дней
+        readfile($path);
     } else {
         http_response_code(404);
     }
@@ -77,12 +123,15 @@ if (preg_match('~^/__assets__/(.+)$~', $uri, $am)) {
     exit;
 }
 
-// Маршрут: /bod — админка (HTML рендер здесь, JS и весь CRUD — в crud.php)
+// Маршрут: админка (HTML рендер здесь; JS — в бандле админки; API — в api.php)
 if ($uri === '' || $uri === false) { $uri = '/'; }
 if ($uri === '/bod') {
     render_admin_page();
     exit;
 }
+
+
+
 
 // Главная: список уровней
 if ($uri === '/') {
@@ -300,9 +349,10 @@ function render_header(string $title, bool $with_topbar = true): void {
     echo '<!doctype html><html lang="ru"><head>';
     echo '<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">';
     echo '<title>' . e($title) . ' — DOMLearn</title>';
-    echo '<link rel="icon" href="' . asset('/__assets__/images/favicon.ico') . '" type="image/x-icon">';
-    echo '<link rel="stylesheet" href="' . asset('/__assets__/style.css') . '?v=' . filemtime(__DIR__ . '/style.css') . '">';
-    echo '<script src="' . asset('/__assets__/app.js') . '?v=' . filemtime(__DIR__ . '/app.js') . '" defer></script>';
+    echo '<link rel="icon" href="' . asset('/images/favicon.ico') . '" type="image/x-icon">';
+    // Публичные стили и скрипты из /assets (с версионированием через filemtime)
+    echo '<link rel="stylesheet" href="' . asset('/assets/style.css') . '?v=' . filemtime(__DIR__ . '/assets/style.css') . '">';
+    echo '<script src="' . asset('/assets/app.js') . '?v=' . filemtime(__DIR__ . '/assets/app.js') . '" defer></script>';
     echo '</head><body class="theme-light">';
     if ($with_topbar) {
         echo '<header class="topbar">';
@@ -344,13 +394,21 @@ function render_404(): void {
     render_footer();
 }
 
-// ===== Рендер админки (HTML). JS загружается из crud.php?action=admin_js =====
+// ===== Рендер админки (HTML). JS загружается из бандла админки (action=admin_js в api.php отдаёт этот файл) =====
 function render_admin_page(): void {
     // Админка: без верхней панели и переключателя темы, всегда светлая тема
     render_header('Админ-панель', false);
     echo '<main class="container admin">';
-    echo '<div id="adminApp"></div>';
-    echo '<script src="' . asset('/crud.php') . '?action=admin_js"></script>';
+    // Подключаем изолированные стили админки
+    echo '<link rel="stylesheet" href="' . asset('/bod/admin-style.css') . '?v=' . filemtime(__DIR__ . '/bod/admin-style.css') . '">';
+    // Прокидываем базовый путь приложения через data-атрибут у контейнера
+    $base = rtrim(str_replace('\\','/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
+    $base = ($base === '' || $base === '/') ? '' : $base;
+    echo '<div id="adminApp" data-admin-base="' . e($base) . '"></div>';
+    // Подключаем модуль редактора до основного бандла админки
+    echo '<script src="' . asset('/bod/editor.js') . '?v=' . filemtime(__DIR__ . '/bod/editor.js') . '"></script>';
+    // Подключаем статический бандл админки, вынесенный из crud.php
+    echo '<script src="' . asset('/bod/bod.js') . '?v=' . filemtime(__DIR__ . '/bod/bod.js') . '"></script>';
     echo '</main>';
     render_footer();
 }
